@@ -1,0 +1,32 @@
+name: opencode-agent
+
+on:
+  repository_dispatch:
+    types: [agent-task]
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenCode
+        run: |
+          set -e
+          curl -fsSL https://opencode.ai/install | bash || npm install -g opencode-ai
+          for d in "$HOME/.opencode/bin" "$HOME/.local/bin" "/usr/local/bin"; do
+            if [ -x "$d/opencode" ]; then echo "$d" >> "$GITHUB_PATH"; fi
+          done
+          export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+          opencode --version
+
+      - name: Run agent task
+        env:
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          TASK_TOKEN: ${{ github.event.client_payload.task_token }}
+          MODEL: ${{ github.event.client_payload.model }}
+          PROMPT: ${{ github.event.client_payload.prompt }}
+          WORKER_URL: ${{ github.event.client_payload.worker_url }}
+        run: bash scripts/task-wrapper.sh

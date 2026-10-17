@@ -1,0 +1,20 @@
+name = "tg-opencode-agent"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+account_id = "74b5f250d9f7dd3aea782731971b0bef"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "KV_ID_PLACEHOLDER"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+WORKER_PUBLIC_URL = "https://tg-opencode-agent.kianirandev.workers.dev"
+ADMIN_CHAT_ID = "7433357700"
+GH_OWNER = "saedario"
+GH_REPO = "tg-opencode-agent"
+HB_MIN = "15"
+IDLE_MIN = "60"
+ZEN_BASE = "https://opencode.ai/zen/v1"
