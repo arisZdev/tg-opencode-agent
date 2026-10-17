@@ -59,10 +59,20 @@ async function maybeWatchdog(env) {
 }
 
 async function authTask(env, req, url) {
-  const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  const token = ((req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "")).trim();
   const id = req.headers.get("x-task-id") || url.searchParams.get("task") || "";
-  if (!token || !id) return null;
-  const t = await getTask(env, id);
+  if (!token) return null;
+  let t = id ? await getTask(env, id) : null;
+  if (!t) {
+    // fallback: authenticate by token alone. Covers agents that omit the
+    // X-Task-Id header (older AGENTS.md curl examples did) — the token is
+    // unique per task and is the actual secret; the id is not secret.
+    const l = await env.KV.list({ prefix: "t:", limit: 200 });
+    for (const k of l.keys) {
+      const c = await env.KV.get(k.name, "json");
+      if (c && c.token === token) { t = c; break; }
+    }
+  }
   if (!t || t.token !== token) return null;
   return t;
 }
