@@ -39,20 +39,30 @@ export default {
 };
 
 async function dedupAndHandle(env, u) {
-  const last = Number((await env.KV.get("g:last_upd")) || 0);
+  let last = 0;
+  try { last = Number((await env.KV.get("g:last_upd")) || 0); } catch (e) { console.error("dedup get", String(e)); }
   if (u.update_id && u.update_id <= last) return;
-  await env.KV.put("g:last_upd", String(u.update_id || Date.now()));
-  await handleUpdate(env, u);
+  try {
+    await handleUpdate(env, u);
+  } finally {
+    // record best-effort AFTER handling — a KV failure must never silence the bot
+    // (also never store Date.now() here: update_id-scale values only)
+    if (u.update_id) {
+      try { await env.KV.put("g:last_upd", String(u.update_id)); }
+      catch (e) { console.error("dedup put", String(e)); }
+    }
+  }
 }
 
-// fallback watchdog (replaces cron trigger): throttled to once per 5 minutes,
-// runs whenever any bot traffic comes in
+// fallback watchdog (replaces cron trigger): throttled to once per 15 minutes,
+// runs whenever any bot traffic comes in. Timestamp write is best-effort and
+// only happens AFTER the check — KV write failures must not block handling.
 async function maybeWatchdog(env) {
   try {
     const last = Number((await env.KV.get("g:last_watchdog")) || 0);
-    if (Date.now() - last < 5 * 60_000) return;
-    await env.KV.put("g:last_watchdog", String(Date.now()));
+    if (Date.now() - last < 15 * 60_000) return;
     await cronCheck(env);
+    try { await env.KV.put("g:last_watchdog", String(Date.now())); } catch (e) {}
   } catch (e) {
     console.error("watchdog", String(e));
   }
@@ -107,8 +117,12 @@ async function agentRoute(env, req, url, ctx) {
   if (p === "/agent/poll" && req.method === "GET") {
     const fups = t.followups || [];
     const kill = !!t.kill, end = !!t.end;
-    t.followups = []; t.kill = false; t.end = false;
-    await putTask(env, t);
+    // write ONLY when something actually changed — idle polls (every 15s per
+    // running task) must not burn the KV daily write quota (1000/day, free plan)
+    if (fups.length || kill || end) {
+      t.followups = []; t.kill = false; t.end = false;
+      try { await putTask(env, t); } catch (e) { console.error("poll put", String(e)); }
+    }
     return json({
       ok: true, kill, end,
       followups: fups.map((f) => ({
@@ -123,7 +137,7 @@ async function agentRoute(env, req, url, ctx) {
     t.run_id = b.run_id || null;
     t.status = "running";
     t.updated = Date.now();
-    await putTask(env, t);
+    try { await putTask(env, t); } catch (e) { console.error("register put", String(e)); }
     ctx.waitUntil(sendMsg(env, t.chat, `▶️ تسک ${t.id} روی GitHub Actions شروع شد.`));
     return json({ ok: true });
   }
@@ -144,7 +158,7 @@ async function agentRoute(env, req, url, ctx) {
   if (p === "/agent/done" && req.method === "POST") {
     const b = await rj(req);
     t.status = "done"; t.finished = Date.now();
-    await putTask(env, t);
+    try { await putTask(env, t); } catch (e) { console.error("done put", String(e)); }
     ctx.waitUntil(sendMsg(env, t.chat, `✅ تسک ${t.id} تمام شد.${b.text ? "\n" + String(b.text).slice(0, 500) : ""}`));
     return json({ ok: true });
   }
@@ -152,7 +166,7 @@ async function agentRoute(env, req, url, ctx) {
   if (p === "/agent/fail" && req.method === "POST") {
     const b = await rj(req);
     t.status = "failed"; t.error = String(b.text || "agent error").slice(0, 500); t.finished = Date.now();
-    await putTask(env, t);
+    try { await putTask(env, t); } catch (e) { console.error("fail put", String(e)); }
     ctx.waitUntil(sendMsg(env, t.chat, `⚠️ تسک ${t.id} خطا داد:\n${t.error}`));
     return json({ ok: true });
   }

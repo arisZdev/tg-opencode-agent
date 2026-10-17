@@ -390,7 +390,12 @@ async function attachFollowup(env, chat, t, pending) {
   t.followups = t.followups || [];
   if (t.followups.length > 50) return sendMsg(env, chat, "صف پیام‌های این تسک پر شده.");
   t.followups.push({ text: pending.text || "", files: pending.file ? [pending.file] : [], at: Date.now() });
-  await putTask(env, t);
+  try {
+    await putTask(env, t);
+  } catch (e) {
+    console.error("followup put", String(e));
+    return sendMsg(env, chat, "⚠️ ذخیره پیام ناموفق بود (سهمیه روزانه KV پر شده). چند دقیقه دیگر دوباره بفرست.");
+  }
   const desc = (pending.text ? "متن" + (pending.file ? "+فایل" : "") : "فایل");
   return sendMsg(env, chat, `📩 ${desc} به صف تسک ${t.id} اضافه شد — تا ~۲۰ ثانیه دیگه تحویل عامل میشه.`);
 }
