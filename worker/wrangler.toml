@@ -5,10 +5,7 @@ account_id = "74b5f250d9f7dd3aea782731971b0bef"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "KV_ID_PLACEHOLDER"
-
-[triggers]
-crons = ["*/5 * * * *"]
+id = "f4826cb41a1444e1b1a5403096f9cb9d"
 
 [vars]
 WORKER_PUBLIC_URL = "https://tg-opencode-agent.kianirandev.workers.dev"

@@ -22,16 +22,23 @@ HB_MIN=15
 IDLE_MIN=60
 
 cfg="$(curl -sf "$API/config" "${AH[@]}")" || { echo "FATAL: cannot fetch config"; exit 1; }
-OC_KEY="$(echo "$cfg" | jq -r '.opencode_key')"
+OC_KEY="$(echo "$cfg" | jq -r '.opencode_key // ""')"
+OR_KEY="$(echo "$cfg" | jq -r '.keys.openrouter // ""')"
+GEM_KEY="$(echo "$cfg" | jq -r '.keys.gemini // ""')"
 HB_MIN="$(echo "$cfg" | jq -r '.heartbeat_min // 15')"
 IDLE_MIN="$(echo "$cfg" | jq -r '.idle_min // 60')"
 export OPENCODE_API_KEY="$OC_KEY"
+export OPENROUTER_API_KEY="$OR_KEY"
+export GEMINI_API_KEY="$GEM_KEY"
+export GOOGLE_API_KEY="$GEM_KEY"
+export GOOGLE_GENERATIVE_AI_API_KEY="$GEM_KEY"
 
 mkdir -p "$HOME/.config/opencode"
+# NOTE: do not add a permission block here — denying any built-in tool makes the
+# opencode zen free tier reject requests with FreeTierError
 cat > "$HOME/.config/opencode/opencode.json" <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
-  "permission": { "edit": "allow", "bash": "allow", "webfetch": "allow" },
   "share": "disabled",
   "provider": { "opencode": { "options": { "apiKey": "$OC_KEY" } } }
 }

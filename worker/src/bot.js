@@ -3,15 +3,21 @@ import { sendMsg, tg, downloadTgFile } from "./tg.js";
 import { rid, bufToB64 } from "./util.js";
 import { createTask, listTasks, getTask, putTask, stopTask, syncFromGithub, STATUS_EMO, STATUS_FA } from "./tasks.js";
 import * as DB from "./db.js";
-import { FREE_MODELS_FALLBACK } from "./models.js";
+import { GEMINI_MODELS, ZEN_FALLBACK, zenLabel } from "./models.js";
 
 const HELP =
   "🤖 ربات عامل اوپن‌کد آماده‌ست!\n\n" +
   "➕ تسک جدید: /new\n" +
   "  ۱) پرامپت کار رو بنویس\n" +
   "  ۲) فایل‌هات رو بفرست (اختیاری، تا ۱۵MB هر فایل)\n" +
-  "  ۳) مدل رایگان رو انتخاب کن\n" +
+  "  ۳) مدل رو انتخاب کن\n" +
   "  ۴) تأیید کن → اجرا روی گیت‌هاب اکشنز شروع میشه\n\n" +
+  "🧠 مدل‌ها:\n" +
+  "  • Gemini (رایگان، از سرور کار می‌کنه) — نیاز به کلید رایگان:\n" +
+  "    /db set gemini_key <کلید از aistudio.google.com>\n" +
+  "  • OpenRouter (مدل‌های :free) — نیاز به کلید رایگان:\n" +
+  "    /db set openrouter_key <کلید از openrouter.ai>\n" +
+  "  • Zen اوپن‌کد (با توکن خودت) — tier رایگانش ممکنه از سرور بلاک باشه\n\n" +
   "💬 وسط کار: هر متن/فایلی بفرستی، می‌پرسم به کدوم تسک بدم؛ عامل ادامه میده.\n" +
   "📦 خروجی‌های عامل خودکار به همین چت میان.\n\n" +
   "🗄 دیتابیس کلید/مقدار (برای ذخیره API key و نکته‌ها):\n" +
@@ -22,7 +28,6 @@ const HELP =
   "  /db del <کلید>\n" +
   "  (عامل هم به این دیتابیس دسترسی خواندن/نوشتن داره)\n\n" +
   "📊 وضعیت تسک‌ها: /tasks\n" +
-  "🧠 مدل‌های رایگان: /models\n" +
   "🛑 توقف فوری تسک: /kill T-xxxx\n" +
   "🏁 پایان تسک: /end T-xxxx\n\n" +
   "⚠️ سقف هر اجرا حدود ۵ ساعت و ۵۵ دقیقه است (محدودیت خود گیت‌هاب).";
@@ -33,35 +38,82 @@ const putW = (env, chat, w) => env.KV.put(`w:${chat}`, JSON.stringify(w));
 const delW = (env, chat) => env.KV.delete(`w:${chat}`);
 
 // ---------- models ----------
+const PAGE = 8;
+
 export async function getModels(env) {
+  const out = [];
+  out.push(...GEMINI_MODELS);
+
   try {
-    const c = await env.KV.get("cache:models", "json");
-    if (c && Date.now() - c.at < 6 * 3600_000 && c.list?.length) return c.list;
-    const r = await fetch(`${env.ZEN_BASE}/models`, {
-      headers: { authorization: `Bearer ${env.OC_API_KEY}` },
-    });
-    if (!r.ok) throw new Error("zen models HTTP " + r.status);
-    const j = await r.json();
-    const ids = (j.data || []).map((m) => m.id)
-      .filter((i) => i.endsWith("-free") || i === "big-pickle");
-    const known = Object.fromEntries(FREE_MODELS_FALLBACK.map((m) => [m.id, m.label]));
-    const list = ids.map((i) => ({ id: i, label: known[i] || i }));
-    // make sure deepseek stays first if present
-    list.sort((a, b) => (a.id.startsWith("deepseek") ? -1 : b.id.startsWith("deepseek") ? 1 : 0));
-    const final = list.length ? list : FREE_MODELS_FALLBACK;
-    await env.KV.put("cache:models", JSON.stringify({ at: Date.now(), list: final }), { expirationTtl: 21600 });
-    return final;
+    const c = await env.KV.get("cache:or", "json");
+    let ids;
+    if (c && Date.now() - c.at < 6 * 3600_000 && c.ids?.length) ids = c.ids;
+    else {
+      const r = await fetch("https://openrouter.ai/api/v1/models");
+      const j = await r.json();
+      ids = (j.data || [])
+        .filter((m) => (m.id || "").endsWith(":free"))
+        .map((m) => m.id)
+        .slice(0, 20);
+      if (ids.length) await env.KV.put("cache:or", JSON.stringify({ at: Date.now(), ids }), { expirationTtl: 21600 });
+    }
+    for (const id of ids) {
+      out.push({ id: "openrouter/" + id, label: id.replace(":free", "") + " •OR", provider: "openrouter" });
+    }
   } catch (e) {
-    console.error("getModels", String(e));
-    return FREE_MODELS_FALLBACK;
+    console.error("openrouter models", String(e));
   }
+
+  try {
+    const c = await env.KV.get("cache:zen", "json");
+    let ids;
+    if (c && Date.now() - c.at < 6 * 3600_000 && c.ids?.length) ids = c.ids;
+    else {
+      const r = await fetch(`${env.ZEN_BASE}/models`, { headers: { authorization: `Bearer ${env.OC_API_KEY}` } });
+      if (!r.ok) throw new Error("zen HTTP " + r.status);
+      const j = await r.json();
+      ids = (j.data || []).map((m) => m.id).filter((i) => i.endsWith("-free") || i === "big-pickle");
+      if (ids.length) await env.KV.put("cache:zen", JSON.stringify({ at: Date.now(), ids }), { expirationTtl: 21600 });
+    }
+    for (const id of ids) out.push({ id: "opencode/" + id, label: zenLabel(id), provider: "opencode" });
+  } catch (e) {
+    console.error("zen models", String(e));
+    for (const id of ZEN_FALLBACK) out.push({ id: "opencode/" + id, label: zenLabel(id), provider: "opencode" });
+  }
+
+  return out;
 }
 
-function modelKeyboard(models) {
-  const rows = [];
-  for (let i = 0; i < models.length; i += 2) {
-    rows.push(models.slice(i, i + 2).map((m) => ({ text: m.label, callback_data: "m:" + m.id })));
+export function providerOf(model) {
+  return String(model || "").split("/")[0];
+}
+
+export async function keyFor(env, model) {
+  const p = providerOf(model);
+  if (p === "opencode") return (env.OC_API_KEY || "") || null;
+  if (p === "openrouter") {
+    const dbk = await DB.dbGet(env, "openrouter_key");
+    return (dbk?.value || env.OPENROUTER_API_KEY || "") || null;
   }
+  if (p === "google") {
+    const dbk = await DB.dbGet(env, "gemini_key");
+    return (dbk?.value || env.GEMINI_API_KEY || "") || null;
+  }
+  return null;
+}
+
+function modelKeyboard(models, page) {
+  const start = page * PAGE;
+  const slice = models.slice(start, start + PAGE);
+  const rows = [];
+  for (let i = 0; i < slice.length; i += 2) {
+    rows.push(slice.slice(i, i + 2).map((m) => ({ text: m.label, callback_data: "m:" + m.id })));
+  }
+  const nav = [];
+  if (page > 0) nav.push({ text: "◀️ قبلی", callback_data: `mp:${page - 1}` });
+  if (start + PAGE < models.length) nav.push({ text: "بعدی ▶️", callback_data: `mp:${page + 1}` });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: `صفحه ${page + 1}/${Math.ceil(models.length / PAGE)} — کل: ${models.length}`, callback_data: "noop" }]);
   return { inline_keyboard: rows };
 }
 
@@ -108,7 +160,7 @@ async function onCmd(env, chat, text) {
     case "/tasks": return cmdTasks(env, chat);
     case "/models": {
       const ms = await getModels(env);
-      return sendMsg(env, chat, "🧠 مدل‌های رایگان:\n" + ms.map((m) => "• " + m.id).join("\n"));
+      return sendMsg(env, chat, "🧠 مدل‌های موجود:\n" + ms.map((m) => "• " + m.id).join("\n"));
     }
     case "/kill": return cmdStop(env, chat, arg.trim(), "kill");
     case "/end": return cmdStop(env, chat, arg.trim(), "end");
@@ -192,20 +244,36 @@ async function startWizard(env, chat) {
     "📝 پرامپت تسک رو بنویس — کامل و دقیق، مثل حرف زدن با یه برنامه‌نویس.\n(لغو: /cancel)");
 }
 
+async function renderModels(env, chat, w, page) {
+  const models = await getModels(env);
+  const p = Math.max(0, Math.min(page, Math.ceil(models.length / PAGE) - 1));
+  w.page = p;
+  await putW(env, chat, w);
+  return sendMsg(env, chat,
+    `🧠 مدل رو انتخاب کن (پیشنهادی: Gemini Flash — از سرور کار می‌کنه):
+فایل‌های ذخیره‌شده: ${(w.files || []).length}`,
+    { reply_markup: modelKeyboard(models, p) });
+}
+
 async function finishFiles(env, chat) {
   const w = await getW(env, chat);
   if (!w || w.step !== "await_files") return;
-  const models = await getModels(env);
   w.step = "await_model";
   await putW(env, chat, w);
-  return sendMsg(env, chat,
-    `🧠 مدل رایگان رو انتخاب کن (پیشنهادی: DeepSeek):\nفایل‌های ذخیره‌شده: ${(w.files || []).length}`,
-    { reply_markup: modelKeyboard(models) });
+  return renderModels(env, chat, w, 0);
 }
 
 async function confirmYes(env, chat) {
   const w = await getW(env, chat);
   if (!w || !w.prompt || !w.model) return sendMsg(env, chat, "اطلاعات تسک کامل نیست؛ دوباره /new بزن.");
+  const key = await keyFor(env, w.model);
+  if (!key) {
+    const p = providerOf(w.model);
+    const how = p === "google"
+      ? "از aistudio.google.com یه کلید رایگان بگیر بعد بزن:\n/db set gemini_key <کلید>"
+      : "از openrouter.ai/keys یه کلید رایگان بگیر بعد بزن:\n/db set openrouter_key <کلید>";
+    return sendMsg(env, chat, `⚠️ برای مدل «${w.model}» کلید provider «${p}» پیدا نشد.\n\n🔑 ${how}\nبعدش دوباره تأیید کن (🚀 شروع کن).`, { reply_markup: CONFIRM_KB });
+  }
   await delW(env, chat);
   await createTask(env, { prompt: w.prompt, model: w.model, files: w.files || [] });
 }
@@ -347,7 +415,14 @@ async function onCb(env, cb) {
         { reply_markup: CONFIRM_KB });
       return await ack();
     }
-    if (data === "files:done" || data === "files:skip") return await finishFiles(env, chat) , await ack();
+    if (data.startsWith("mp:")) {
+      const w = await getW(env, chat);
+      if (!w || w.step !== "await_model") return await ack();
+      await renderModels(env, chat, w, Number(data.slice(3)) || 0);
+      return await ack();
+    }
+    if (data === "noop") return await ack();
+    if (data === "files:done" || data === "files:skip") { await finishFiles(env, chat); return await ack(); }
     if (data === "cfm:yes") return await confirmYes(env, chat), await ack();
     if (data === "cfm:no") { await delW(env, chat); await sendMsg(env, chat, "لغو شد."); return await ack(); }
     if (data === "new") return await startWizard(env, chat), await ack();

@@ -20,6 +20,7 @@ export default {
         }
         const u = await req.json();
         ctx.waitUntil(dedupAndHandle(env, u));
+        ctx.waitUntil(maybeWatchdog(env));
         return text("ok");
       }
 
@@ -44,6 +45,19 @@ async function dedupAndHandle(env, u) {
   await handleUpdate(env, u);
 }
 
+// fallback watchdog (replaces cron trigger): throttled to once per 5 minutes,
+// runs whenever any bot traffic comes in
+async function maybeWatchdog(env) {
+  try {
+    const last = Number((await env.KV.get("g:last_watchdog")) || 0);
+    if (Date.now() - last < 5 * 60_000) return;
+    await env.KV.put("g:last_watchdog", String(Date.now()));
+    await cronCheck(env);
+  } catch (e) {
+    console.error("watchdog", String(e));
+  }
+}
+
 async function authTask(env, req, url) {
   const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
   const id = req.headers.get("x-task-id") || url.searchParams.get("task") || "";
@@ -59,10 +73,17 @@ async function agentRoute(env, req, url, ctx) {
   if (p === "/agent/config" && req.method === "GET") {
     const t = await authTask(env, req, url);
     if (!t) return json({ ok: false, error: "unauthorized" }, 401);
+    const orDb = await DB.dbGet(env, "openrouter_key");
+    const gemDb = await DB.dbGet(env, "gemini_key");
     return json({
       ok: true,
       task_id: t.id,
       opencode_key: env.OC_API_KEY,
+      keys: {
+        opencode: env.OC_API_KEY || "",
+        openrouter: orDb?.value || env.OPENROUTER_API_KEY || "",
+        gemini: gemDb?.value || env.GEMINI_API_KEY || "",
+      },
       poll_s: 15,
       heartbeat_min: Number(t.hb_min || env.HB_MIN || 15),
       idle_min: Number(t.idle_min || env.IDLE_MIN || 60),
