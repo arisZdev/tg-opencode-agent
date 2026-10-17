@@ -166,6 +166,13 @@ async function agentRoute(env, req, url, ctx) {
     const bytes = await f.arrayBuffer();
     const name = f.name || "file.bin";
     const r = await sendDoc(env, t.chat, bytes, name, `📎 [${t.id}] ${name}${cap ? "\n" + cap : ""}`);
+    // delivery audit trail (also lets external tools verify uploads)
+    try {
+      await env.KV.put(`ul:${Date.now()}`, JSON.stringify({
+        task: t.id, name, size: f.size, ok: !!r.ok,
+        error: r.ok ? undefined : r.description, at: Date.now(),
+      }), { expirationTtl: 7 * 24 * 3600 });
+    } catch (e) { console.error("ul log", String(e)); }
     return json({ ok: !!r.ok, error: r.ok ? undefined : r.description });
   }
 
