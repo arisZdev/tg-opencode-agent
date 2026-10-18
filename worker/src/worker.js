@@ -1,8 +1,8 @@
 // ---------- worker entry: router ----------
 import { json, text, rj, b64ToBuf } from "./util.js";
 import { handleUpdate } from "./bot.js";
-import { cronCheck, getTask, putTask } from "./tasks.js";
-import { sendMsg, sendDoc } from "./tg.js";
+import { cronCheck, getTask, putTask, renewTask } from "./tasks.js";
+import { notify, notifyDoc } from "./notify.js";
 import * as DB from "./db.js";
 
 export default {
@@ -19,7 +19,19 @@ export default {
           return text("forbidden", 403);
         }
         const u = await req.json();
-        ctx.waitUntil(dedupAndHandle(env, u));
+        ctx.waitUntil(dedupAndHandle(env, u, "tg", "g:last_upd"));
+        ctx.waitUntil(maybeWatchdog(env));
+        return text("ok");
+      }
+
+      // bale.ai webhook — secret is embedded in the registered URL path
+      if (p.startsWith("/bale/webhook") && req.method === "POST") {
+        const secret = p.slice("/bale/webhook/".length);
+        if (!env.BALE_WEBHOOK_SECRET || secret !== env.BALE_WEBHOOK_SECRET) {
+          return text("forbidden", 403);
+        }
+        const u = await req.json();
+        ctx.waitUntil(dedupAndHandle(env, u, "bale", "g:last_upd_bale"));
         ctx.waitUntil(maybeWatchdog(env));
         return text("ok");
       }
@@ -38,17 +50,17 @@ export default {
   },
 };
 
-async function dedupAndHandle(env, u) {
+async function dedupAndHandle(env, u, pf, key) {
   let last = 0;
-  try { last = Number((await env.KV.get("g:last_upd")) || 0); } catch (e) { console.error("dedup get", String(e)); }
+  try { last = Number((await env.KV.get(key)) || 0); } catch (e) { console.error("dedup get", String(e)); }
   if (u.update_id && u.update_id <= last) return;
   try {
-    await handleUpdate(env, u);
+    await handleUpdate(env, u, pf);
   } finally {
     // record best-effort AFTER handling — a KV failure must never silence the bot
     // (also never store Date.now() here: update_id-scale values only)
     if (u.update_id) {
-      try { await env.KV.put("g:last_upd", String(u.update_id)); }
+      try { await env.KV.put(key, String(u.update_id)); }
       catch (e) { console.error("dedup put", String(e)); }
     }
   }
@@ -107,6 +119,7 @@ async function agentRoute(env, req, url, ctx) {
       poll_s: 15,
       heartbeat_min: Number(t.hb_min || env.HB_MIN || 15),
       idle_min: Number(t.idle_min || env.IDLE_MIN || 60),
+      renew_min: Number(env.RENEW_MIN || 330),
       worker_url: env.WORKER_PUBLIC_URL,
     });
   }
@@ -138,20 +151,27 @@ async function agentRoute(env, req, url, ctx) {
     t.status = "running";
     t.updated = Date.now();
     try { await putTask(env, t); } catch (e) { console.error("register put", String(e)); }
-    ctx.waitUntil(sendMsg(env, t.chat, `▶️ تسک ${t.id} روی GitHub Actions شروع شد.`));
+    ctx.waitUntil(notify(env, `▶️ تسک ${t.id} روی GitHub Actions شروع شد${Number(t.attempt || 1) > 1 ? ` (تلاش ${t.attempt})` : ""}.`));
     return json({ ok: true });
+  }
+
+  // runner-window renewal: agent calls this shortly before the ~6h kill
+  if (p === "/agent/renew" && req.method === "POST") {
+    const b = await rj(req);
+    const r = await renewTask(env, t, { text: b.carry_text || "", files: b.carry_files || [] });
+    return json({ ok: r.ok, attempt: r.attempt, error: r.error }, r.ok ? 200 : 400);
   }
 
   if (p === "/agent/message" && req.method === "POST") {
     const b = await rj(req);
     const txt = String(b.text || "").slice(0, 60000);
-    ctx.waitUntil(sendMsg(env, t.chat, `🤖 [${t.id}]\n${txt || "(پاسخ متنی خالی بود)"}`));
+    ctx.waitUntil(notify(env, `🤖 [${t.id}]\n${txt || "(پاسخ متنی خالی بود)"}`));
     return json({ ok: true });
   }
 
   if (p === "/agent/status" && req.method === "POST") {
     const b = await rj(req);
-    ctx.waitUntil(sendMsg(env, t.chat, `⏳ [${t.id}] ${String(b.text || "هنوز در حال اجراست...")}`));
+    ctx.waitUntil(notify(env, `⏳ [${t.id}] ${String(b.text || "هنوز در حال اجراست...")}`));
     return json({ ok: true });
   }
 
@@ -159,7 +179,7 @@ async function agentRoute(env, req, url, ctx) {
     const b = await rj(req);
     t.status = "done"; t.finished = Date.now();
     try { await putTask(env, t); } catch (e) { console.error("done put", String(e)); }
-    ctx.waitUntil(sendMsg(env, t.chat, `✅ تسک ${t.id} تمام شد.${b.text ? "\n" + String(b.text).slice(0, 500) : ""}`));
+    ctx.waitUntil(notify(env, `✅ تسک ${t.id} تمام شد.${b.text ? "\n" + String(b.text).slice(0, 500) : ""}`));
     return json({ ok: true });
   }
 
@@ -167,7 +187,7 @@ async function agentRoute(env, req, url, ctx) {
     const b = await rj(req);
     t.status = "failed"; t.error = String(b.text || "agent error").slice(0, 500); t.finished = Date.now();
     try { await putTask(env, t); } catch (e) { console.error("fail put", String(e)); }
-    ctx.waitUntil(sendMsg(env, t.chat, `⚠️ تسک ${t.id} خطا داد:\n${t.error}`));
+    ctx.waitUntil(notify(env, `⚠️ تسک ${t.id} خطا داد:\n${t.error}`));
     return json({ ok: true });
   }
 
@@ -179,15 +199,17 @@ async function agentRoute(env, req, url, ctx) {
     const cap = String(fd.get("caption") || "");
     const bytes = await f.arrayBuffer();
     const name = f.name || "file.bin";
-    const r = await sendDoc(env, t.chat, bytes, name, `📎 [${t.id}] ${name}${cap ? "\n" + cap : ""}`);
+    const r = await notifyDoc(env, bytes, name, `📎 [${t.id}] ${name}${cap ? "\n" + cap : ""}`);
+    const okAny = !!(r.tg?.ok || r.bale?.ok);
     // delivery audit trail (also lets external tools verify uploads)
     try {
       await env.KV.put(`ul:${Date.now()}`, JSON.stringify({
-        task: t.id, name, size: f.size, ok: !!r.ok,
-        error: r.ok ? undefined : r.description, at: Date.now(),
+        task: t.id, name, size: f.size,
+        ok: okAny, ok_tg: !!r.tg?.ok, ok_bale: !!r.bale?.ok,
+        error: okAny ? undefined : (r.tg?.description || r.bale?.description), at: Date.now(),
       }), { expirationTtl: 7 * 24 * 3600 });
     } catch (e) { console.error("ul log", String(e)); }
-    return json({ ok: !!r.ok, error: r.ok ? undefined : r.description });
+    return json({ ok: okAny, error: okAny ? undefined : (r.tg?.description || r.bale?.description || "delivery failed") });
   }
 
   if (p.startsWith("/agent/file/") && req.method === "GET") {
