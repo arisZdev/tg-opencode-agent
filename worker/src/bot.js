@@ -318,8 +318,9 @@ async function renderModels(env, chat, w, page, pf) {
   const A = P(env, pf);
   const models = await getModels(env);
   const p = Math.max(0, Math.min(page, Math.ceil(models.length / PAGE) - 1));
-  w.page = p;
-  await putW(env, chat, w);
+  // NOTE: no putW here — a slow model-list fetch used to overwrite a model the
+  // user had already picked while this render was in flight (classic race).
+  // w.page is never read anywhere; the callback carries the page explicitly.
   return A.send(chat,
     `🧠 مدل رو انتخاب کن (پیشنهادی: Gemini Flash — از سرور کار می‌کنه):
 فایل‌های ذخیره‌شده: ${(w.files || []).length}`,
