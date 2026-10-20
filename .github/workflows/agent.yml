@@ -35,6 +35,8 @@ jobs:
           MODEL: ${{ github.event.client_payload.model }}
           PROMPT: ${{ github.event.client_payload.prompt }}
           WORKER_URL: ${{ github.event.client_payload.worker_url }}
-          RUNNER_TOKEN: ${{ github.event.client_payload.runner_token }}
+          # repo secret — dispatch payloads are NOT auto-masked in logs, so the
+          # runner token must never travel through client_payload (public repo!)
+          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/task-wrapper.sh

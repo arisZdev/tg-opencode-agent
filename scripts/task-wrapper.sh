@@ -304,9 +304,18 @@ curl -sf -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Conten
   -d '{"booted":true}' >/dev/null 2>&1 || true
 
 IDLE_START=0
+IDLE_N=0
 while true; do
-  r="$(curl -sf -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' \
-    -d "$(jq -cn --argjson rid "${GITHUB_RUN_ID:-0}" '{run_id:$rid}')" 2>/dev/null || echo '{}')"
+  httpc="$(curl -s -o /tmp/next_resp.json -w '%{http_code}' -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson rid "${GITHUB_RUN_ID:-0}" '{run_id:$rid}')" 2>/dev/null || echo 000)"
+  r="$(cat /tmp/next_resp.json 2>/dev/null || echo '{}')"
+  # diagnosability: never idle silently — HTTP/worker errors and idle ticks
+  # go to the Actions log so a dead claim loop is visible from the outside
+  if [ "$httpc" != "200" ]; then
+    echo "[next] HTTP $httpc: $(head -c 200 /tmp/next_resp.json 2>/dev/null)"
+  elif [ "$(echo "$r" | jq -r '.ok // true')" = "false" ]; then
+    echo "[next] worker error: $(echo "$r" | jq -r '.error // "unknown"' | head -c 200)"
+  fi
   if [ "$(echo "$r" | jq -r '.off // false')" = "true" ]; then
     echo "agent off by user"; exit 0
   fi
@@ -319,12 +328,16 @@ while true; do
         -d '{"bye":true}' >/dev/null 2>&1 || true
       exit 0
     fi
+    IDLE_N=$((IDLE_N + 1))
+    [ $((IDLE_N % 4)) -eq 1 ] && echo "[next] idle $(( ($(date +%s) - IDLE_START) / 60 ))/${AGENT_IDLE_MIN}m"
     sleep "$POLL_S"
     continue
   fi
   IDLE_START=0
   TASK_ID="$tid"
   TASK_TOKEN="$(echo "$r" | jq -r '.task.task_token // ""')"
+  [ -n "$TASK_TOKEN" ] && echo "::add-mask::$TASK_TOKEN"
+  echo "[next] claimed $TASK_ID (model: $(echo "$r" | jq -r '.task.model // "?"'))"
   MODEL="$(echo "$r" | jq -r '.task.model // ""')"
   PROMPT="$(echo "$r" | jq -r '.task.prompt // ""')"
   BASE_PROMPT="$(echo "$r" | jq -r '.task.base // ""')"
