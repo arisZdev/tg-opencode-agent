@@ -1,7 +1,7 @@
 # Delivering results to the user
 
-Your text replies are delivered to the user automatically — just answer normally.
-To send any FILE (code, generated artifacts, results) to the user, run this command:
+Your text replies are delivered to the user automatically on BOTH channels (Telegram + Bale) — just answer normally.
+To send any FILE (code, generated artifacts, results) to the user (delivered on both channels too), run this command:
 
     curl -s -X POST "$WORKER_URL/agent/upload" -H "Authorization: Bearer $TASK_TOKEN" -H "X-Task-Id: $TASK_ID" -F "file=@<path-to-file>" -F "caption=<optional short caption>"
 

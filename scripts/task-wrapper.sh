@@ -11,6 +11,10 @@
 # worker's /agent/renew and exits. Short runs = low-profile usage pattern.
 set -uo pipefail
 
+# public-repo hygiene: mask runtime secrets so they never appear in Actions logs
+[ -n "${TASK_TOKEN:-}" ] && echo "::add-mask::$TASK_TOKEN"
+[ -n "${RUNNER_TOKEN:-}" ] && echo "::add-mask::$RUNNER_TOKEN"
+
 : "${WORKER_URL:?WORKER_URL missing}"
 API="$WORKER_URL/agent"
 MODE="daemon"
@@ -241,7 +245,17 @@ task_session() {
   git commit -qm init >/dev/null 2>&1 || true
   paths="$(dl_initial_files "$init_files" | tr '\n' ' ')"
   tjpost register "{\"run_id\":${GITHUB_RUN_ID:-0}}"
-  msg="$PROMPT"
+  # base prompt (editable via the bot's /promptedit) is prepended to the user task
+  if [ -n "${BASE_PROMPT:-}" ]; then
+    msg="🧬 دستورالعمل پایه (سیستم‌پرامپت):
+$BASE_PROMPT
+
+════════════════════════
+📋 درخواست کاربر برای این تسک:
+$PROMPT"
+  else
+    msg="$PROMPT"
+  fi
   [ -n "${paths// /}" ] && msg="$msg
 فایل‌های اولیه (ذخیره‌شده در): $paths"
   post_msg "▶️ شروع تسک با مدل $MODEL"
@@ -313,6 +327,7 @@ while true; do
   TASK_TOKEN="$(echo "$r" | jq -r '.task.task_token // ""')"
   MODEL="$(echo "$r" | jq -r '.task.model // ""')"
   PROMPT="$(echo "$r" | jq -r '.task.prompt // ""')"
+  BASE_PROMPT="$(echo "$r" | jq -r '.task.base // ""')"
   INIT_FILES="$(echo "$r" | jq -c '.task.files // []')"
   RUN_COUNT=0
   KILL=false; END=false; RC=0; OUT=""

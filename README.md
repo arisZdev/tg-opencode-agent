@@ -1,55 +1,56 @@
-# عامل اوپن‌کد روی گیت‌هاب اکشنز + کنترل از تلگرام
+# OpenCode agent on GitHub Actions — controlled via Telegram & Bale
 
-این ریپو یک عامل کدنویسی (OpenCode CLI) را روی GitHub Actions اجرا می‌کند که از طریق ربات تلگرام و یک Cloudflare Worker کنترل می‌شود.
+This repo runs a coding agent (OpenCode CLI) on GitHub Actions, controlled by a private Cloudflare Worker through two chat channels at once: **Telegram** and **Bale.ai**.
 
-## معماری
+> The Worker source is **not** in this repo (deployed privately via Wrangler). This repo contains only the Actions workflow and the agent-side wrapper.
+
+## Architecture
 
 ```
-تلگرام ⇄ Cloudflare Worker (وب‌هوک + صف + دیتابیس) ⇄ GitHub Actions (اجرای opencode)
-                                   ↑
-                    عامل فایل‌ها را با curl به اندپوینت ورکر می‌فرستد
+Telegram ─┐                                   ┌─ deliver text to BOTH channels
+          ├─ Cloudflare Worker (webhook,      │
+Bale.ai  ─┘   task queue, KV db) ─ GitHub Actions runner (opencode CLI)
+                     │  repository_dispatch "agent-boot"           │
+                     └─ /agent/next  ← runner claims queued tasks ─┘
+agent files → POST $WORKER_URL/agent/upload → delivered to both chats
 ```
 
-- **ورکر** (`worker/`): درگاه تلگرام، ویزارد ساخت تسک، صف پیام‌های میانه کار، دیتابیس کلید/مقدار و نمایشگر وضعیت
-- **workflow** (`.github/workflows/agent.yml`): با `repository_dispatch` فعال می‌شود؛ سقف هر اجرا ۳۵۵ دقیقه
-- **wrapper** (`scripts/task-wrapper.sh`): opencode را اجرا می‌کند، هر ۱۵ ثانیه پیام‌های جدید را poll می‌کند، ضربان وضعیت هر ۱۵ دقیقه و بستن خودکار بعد از ۶۰ دقیقه بی‌کاری
+- **workflow** (`.github/workflows/agent.yml`): triggered by `repository_dispatch` (event `agent-boot`); timeout 355 min per run.
+- **wrapper** (`scripts/task-wrapper.sh`): daemon mode — boots, announces, claims queued tasks one by one (`/agent/next`), runs `opencode run` per task, polls followups every 15 s, heartbeats every 15 min, and shuts itself down after 10 idle minutes.
+- Runtime secrets (`TASK_TOKEN`, `RUNNER_TOKEN`) are masked in logs (`::add-mask::`) because this repo is public and Actions logs are visible.
 
-## جریان کار
+## Flow
 
-1. در ربات `/new` → پرامپت → فایل‌ها (اختیاری) → انتخاب مدل → تأیید
-2. ورکر تسک را به اکشنز dispatch می‌کند (چند تسک همزمان = چند اجرای موازی)
-3. خروجی عامل و فایل‌هایش مستقیم به چت تلگرام می‌آیند
-4. وسط کار: هر متن/فایل بفرستی به صف همان تسک اضافه می‌شود (انتخاب تسک با دکمه)
-5. بعد از ۶۰ دقیقه بدون پیام جدید، تسک خودش بسته می‌شود
-6. `/kill T-xxxx` توقف فوری، `/end T-xxxx` پایان نرم، `/tasks` وضعیت همه
+1. `/on` in chat → a runner boots and waits for tasks (or just send `/new` — it boots automatically).
+2. `/new` → prompt → optional files → pick model → confirm → task is queued.
+3. The daemon claims the task, prepends the owner-editable **base prompt** (system instructions, delivered by the Worker), and runs the task.
+4. Agent output text and files arrive directly in both chats (Telegram + Bale).
+5. Mid-task: send any text/file → it is attached to the running task's followup queue.
+6. After 10 minutes with no new messages the task closes; after 10 minutes with no tasks the runner shuts itself down (short-run usage pattern).
+7. `/kill T-xxxx` force stop · `/end T-xxxx` graceful end · `/renew T-xxxx` re-run on a fresh runner · `/tasks` status.
 
-## مدل‌ها
+## Anti-ban / usage-pattern notes
 
-منوی مدل از سه provider تشکیل می‌شود:
+- Public repo → unlimited Actions minutes, no hidden large workloads.
+- Runs are short and task-scoped; a daemon boots only on demand and exits after 10 idle minutes.
+- No tokens/keys are committed; everything sensitive lives in Worker secrets and is passed per-run via `repository_dispatch` payload (masked in logs).
+- GitHub kills a job at ~6 h; the wrapper renews the run on a fresh runner before the cap (up to 3 attempts).
 
-| Provider | وضعیت روی سرور | کلید |
+## Models
+
+| Provider | Status | Key |
 |---|---|---|
-| Google Gemini (flash) | ✅ کار می‌کند | `/db set gemini_key <کلید رایگان از aistudio.google.com>` |
-| OpenRouter (مدل‌های `:free`) | ✅ کار می‌کند | `/db set openrouter_key <کلید رایگان از openrouter.ai>` |
-| OpenCode Zen (رایگان) | ⚠️ tier رایگان از IPهای سروری/CI بلاک است (خطای FreeTierError؛ policy رسمی از ۲۰۲۶-۰۹) | توکن فعلی در Secret ورکر |
+| Google Gemini (flash) | ✅ works from Actions | `/db set gemini_key <free key from aistudio.google.com>` |
+| OpenRouter (`:free` models) | ✅ works | `/db set openrouter_key <free key from openrouter.ai>` |
+| OpenCode Zen (free tier) | ⚠️ free tier rejects server/CI IPs since 2026-09 (official policy) | token stored as Worker secret |
 
-نکته: حتماً در wrapper بلوک `permission` به کانفیگ opencode اضافه نکنید؛ deny کردن هر ابزار داخلی باعث رد شدن دروازه‌ی tier رایگان زن می‌شود.
+Note: do NOT add a `permission` block to the opencode config in the wrapper — denying any built-in tool makes the Zen free-tier gateway reject requests (FreeTierError).
 
-## دیتابیس مشترک (KV)
+## Shared key-value database
 
-- از تلگرام: `/db set <کلید> <مقدار>`، `/db get`، `/db list`، `/db comment`، `/db del`
-- از داخل عامل: اندپوینت‌های `$WORKER_URL/agent/db/...` (توضیح در `AGENTS.md`)
+- From chat: `/db set|get|list|comment|del`
+- From the agent: `$WORKER_URL/agent/db/...` endpoints (see `AGENTS.md`)
 
-## نکته‌ها
+## Worker
 
-- هیچ توکنی داخل این ریپو نیست؛ همه در Secret های ورکر (TG_BOT_TOKEN، GH_TOKEN، OC_API_KEY، TG_WEBHOOK_SECRET)
-- ریپو عمومی است چون مینوت اکشنز برای ریپوی عمومی نامحدود است
-- توکن هر تسک موقتی است و فقط همان تسک را کنترل می‌کند
-- محدودیت سخت گیت‌هاب: هر job حداکثر ۶ ساعت؛ برای تسک‌های طولانی‌تر باید تقسیم کرد
-- ورکر هر ۵ دقیقه با cron وضعیت تسک‌های در جریان را با گیت‌هاب چک می‌کند و خطاها را خبر می‌دهد
-
-## به‌روزرسانی ورکر
-
-```bash
-cd worker && npx wrangler deploy
-```
+The Worker (Telegram/Bale webhook bot, task queue, KV database, agent endpoints) is deployed privately with Wrangler and is not part of this public repo.
