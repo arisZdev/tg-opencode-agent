@@ -26,6 +26,8 @@ export async function listTasks(env) {
 // Short, task-scoped runs keep the GitHub usage pattern low-profile (ban-safe).
 export async function startAgent(env, { force = false } = {}) {
   if (!env.RUNNER_TOKEN) return { ok: false, status: 500 };
+  // an explicit /on always wins over a pending /off signal
+  try { await env.KV.delete("g:agent_off"); } catch (e) {}
   if (!force) {
     const last = Number((await env.KV.get("g:boot_at").catch(() => null)) || 0);
     if (last && Date.now() - last < 120_000) return { ok: true, already: true };
@@ -54,6 +56,11 @@ export async function runnerNext(env, runId, { checkOnly = false } = {}) {
   const idleMin = Number(env.AGENT_IDLE_MIN || env.IDLE_MIN || 10);
   let off = false;
   try { off = !!(await env.KV.get("g:agent_off")); } catch (e) {}
+  if (off && !checkOnly) {
+    // one-shot signal: consume it so future boots are not blocked
+    try { await env.KV.delete("g:agent_off"); } catch (e) {}
+    return { ok: true, off: true, task: null, idle_min: idleMin };
+  }
   if (off || checkOnly) return { ok: true, off, task: null, idle_min: idleMin };
   try { await env.KV.delete("g:agent_off"); } catch (e) {}
   const tasks = await listTasks(env);
