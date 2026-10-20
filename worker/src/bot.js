@@ -2,17 +2,21 @@
 import { sendMsg as tgSend, tg as tgApi, downloadTgFile } from "./tg.js";
 import { sendMsg as baleSend, bale as baleApi, downloadFile as baleDownload, baleEnabled } from "./bale.js";
 import { rid, bufToB64 } from "./util.js";
-import { createTask, listTasks, getTask, putTask, stopTask, renewTask, syncFromGithub, STATUS_EMO, STATUS_FA } from "./tasks.js";
+import { createTask, listTasks, getTask, putTask, stopTask, renewTask, startAgent, stopAgent, syncFromGithub, STATUS_EMO, STATUS_FA } from "./tasks.js";
 import * as DB from "./db.js";
 import { GEMINI_MODELS, ZEN_FALLBACK, zenLabel } from "./models.js";
 
 const HELP =
   "🤖 ربات عامل اوپن‌کد آماده‌ست!\n\n" +
+  "🤖 ایجنت (رانر گیت‌هاب):\n" +
+  "  /on — روشن کردن ایجنت (یا دکمه در /tasks)\n" +
+  "  /off — خاموش کردن ایجنت\n" +
+  "  بعد از آخرین تسک، ۱۰ دقیقه تسک جدیدی نرسد، خودش خاموش می‌شود.\n\n" +
   "➕ تسک جدید: /new\n" +
   "  ۱) پرامپت کار رو بنویس\n" +
   "  ۲) فایل‌هات رو بفرست (اختیاری، تا ۱۵MB هر فایل)\n" +
   "  ۳) مدل رو انتخاب کن\n" +
-  "  ۴) تأیید کن → اجرا روی گیت‌هاب اکشنز شروع میشه\n\n" +
+  "  ۴) تأیید کن → ایجنت تسک رو برمی‌داره\n\n" +
   "🧠 مدل‌ها:\n" +
   "  • Gemini (رایگان، از سرور کار می‌کنه) — نیاز به کلید رایگان:\n" +
   "    /db set gemini_key <کلید از aistudio.google.com>\n" +
@@ -32,7 +36,7 @@ const HELP =
   "🛑 توقف فوری تسک: /kill T-xxxx\n" +
   "🏁 پایان تسک: /end T-xxxx\n" +
   "🔄 شروع دوباره تسک روی رانر تازه: /renew T-xxxx\n\n" +
-  "⚠️ سقف هر اجرا حدود ۵ ساعت و ۵۵ دقیقه است؛ ربات خودش قبل از سقف، تسک را روی رانر تازه ادامه می‌دهد (تا ۳ تلاش).";
+  "⚠️ سقف هر اجرا حدود ۵.۵ ساعت است؛ ربات خودش قبل از سقف، تسک را روی رانر تازه ادامه می‌دهد (تا ۳ تلاش).";
 
 // ---------- per-platform adapter ----------
 function P(env, pf) {
@@ -191,6 +195,8 @@ async function onCmd(env, chat, text, pf) {
     case "/kill": return cmdStop(env, chat, arg.trim(), "kill", pf);
     case "/end": return cmdStop(env, chat, arg.trim(), "end", pf);
     case "/renew": return cmdRenew(env, chat, arg.trim(), pf);
+    case "/on": return cmdAgent(env, chat, "on", pf);
+    case "/off": return cmdAgent(env, chat, "off", pf);
     case "/db": return cmdDb(env, chat, rest, pf);
     case "/id": return A.send(chat, `پلتفرم: ${A.label} — شناسه چت شما: ` + chat);
     default: return A.send(chat, "دستور ناشناخته. راهنما: /start");
@@ -217,6 +223,10 @@ async function cmdTasks(env, chat, pf) {
       ]);
     }
   }
+  rows.push([
+    { text: "🟢 روشن کردن ایجنت", callback_data: "on" },
+    { text: "⏹ خاموش کردن ایجنت", callback_data: "off" },
+  ]);
   rows.push([{ text: "➕ تسک جدید", callback_data: "new" }]);
   return A.send(chat, lines.join("\n"), { reply_markup: { inline_keyboard: rows } });
 }
@@ -228,6 +238,22 @@ async function cmdStop(env, chat, id, mode, pf) {
   if (!t) return A.send(chat, "تسکی با آیدی «" + id + "» پیدا نشد.");
   if (!["queued", "running"].includes(t.status)) return A.send(chat, "این تسک در حال اجرا نیست (" + (STATUS_FA[t.status] || t.status) + ").");
   await stopTask(env, t, mode);
+}
+
+async function cmdAgent(env, chat, mode, pf) {
+  const A = P(env, pf);
+  if (mode === "on") {
+    const s = await startAgent(env);
+    if (!s.ok) {
+      const extra = s.status === 403 ? "\nاکانت گیت‌هاب ساسپند است یا توکن مشکل دارد." : "";
+      return A.send(chat, `⚠️ روشن کردن ایجنت ناموفق بود (HTTP ${s.status}).${extra}`);
+    }
+    return A.send(chat, s.already
+      ? "🟢 ایجنت از قبل روشن است و منتظر تسک است."
+      : "🟢 درخواست روشن‌شدن ایجنت ثبت شد؛ ~۱ دقیقه دیگر آماده‌ست. تسک‌ها را با /new بده.");
+  }
+  await stopAgent(env);
+  return A.send(chat, "⏹ درخواست خاموشی ایجنت ثبت شد؛ تا ~۱ دقیقه دیگر بسته می‌شود.\n(تسک‌های صف‌شده می‌مانند و بعد از /on اجرا می‌شوند)");
 }
 
 async function cmdRenew(env, chat, id, pf) {
@@ -496,6 +522,8 @@ async function onCb(env, cb, pf) {
     if (data.startsWith("kil:")) { const t = await getTask(env, data.slice(4)); if (t) await stopTask(env, t, "kill"); return await ack(); }
     if (data.startsWith("end:")) { const t = await getTask(env, data.slice(4)); if (t) await stopTask(env, t, "end"); return await ack(); }
     if (data.startsWith("rnw:")) { const t = await getTask(env, data.slice(4)); if (t) await renewTask(env, t, {}); return await ack(); }
+    if (data === "on") { await cmdAgent(env, chat, "on", pf); return await ack(); }
+    if (data === "off") { await cmdAgent(env, chat, "off", pf); return await ack(); }
     return await ack();
   } catch (e) {
     console.error("onCb", data, String(e));

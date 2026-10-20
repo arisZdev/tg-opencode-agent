@@ -2,7 +2,7 @@ name: opencode-agent
 
 on:
   repository_dispatch:
-    types: [agent-task]
+    types: [agent-boot, agent-task]
   workflow_dispatch:
 
 # GITHUB_TOKEN may re-dispatch this workflow (runner-window renewal fallback)
@@ -28,12 +28,13 @@ jobs:
           export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
           opencode --version
 
-      - name: Run agent task
+      - name: Run agent
         env:
           TASK_ID: ${{ github.event.client_payload.task_id }}
           TASK_TOKEN: ${{ github.event.client_payload.task_token }}
           MODEL: ${{ github.event.client_payload.model }}
           PROMPT: ${{ github.event.client_payload.prompt }}
           WORKER_URL: ${{ github.event.client_payload.worker_url }}
+          RUNNER_TOKEN: ${{ github.event.client_payload.runner_token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/task-wrapper.sh

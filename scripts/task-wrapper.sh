@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
-# OpenCode agent wrapper
-# Runs opencode on GitHub Actions and relays messages/files between
-# the user (Telegram/Bale, via the Cloudflare worker) and the agent.
+# OpenCode agent wrapper — two modes:
+#  1) daemon (dispatch type agent-boot): RUNNER_TOKEN in env. Boots, announces,
+#     then repeatedly asks the worker for queued tasks, runs them one by one,
+#     and shuts itself down after AGENT_IDLE_MIN (10) idle minutes.
+#  2) legacy single-task (dispatch type agent-task): TASK_ID/TASK_TOKEN set.
+#     Runs exactly one task then exits (kept for backward compatibility).
 #
 # Runner-window renewal: GitHub kills hosted jobs at ~6h. Shortly before the
-# cap (RENEW_MIN, default 330min) the wrapper hands the task to a fresh runner
-# via the worker's /agent/renew (which re-dispatches this workflow) and exits.
+# cap (RENEW_MIN) the wrapper hands the current task to a fresh runner via the
+# worker's /agent/renew and exits. Short runs = low-profile usage pattern.
 set -uo pipefail
 
-: "${WORKER_URL:?WORKER_URL missing}" "${TASK_ID:?TASK_ID missing}" \
-  "${TASK_TOKEN:?TASK_TOKEN missing}" "${MODEL:?MODEL missing}" "${PROMPT:?PROMPT missing}"
-
+: "${WORKER_URL:?WORKER_URL missing}"
 API="$WORKER_URL/agent"
-AH=(-H "Authorization: Bearer $TASK_TOKEN" -H "X-Task-Id: $TASK_ID")
+MODE="daemon"
+[ -n "${TASK_ID:-}" ] && [ -n "${TASK_TOKEN:-}" ] && MODE="legacy"
+
+START_TS="$(date +%s)"
+RENEW_MIN=330
 POLL_S=15
 RUN_COUNT=0
 KILL=false
@@ -20,58 +25,59 @@ END=false
 FUPS="[]"
 OUT=""
 RC=0
+TASK_REASON="ok"
 LAST_HB="$(date +%s)"
 LAST_ACT="$(date +%s)"
 HB_MIN=15
-IDLE_MIN=60
-RENEW_MIN=330
-START_TS="$(date +%s)"
-CUR_MSG=""
+IDLE_MIN=10
+AGENT_IDLE_MIN=10
+OC_KEY=""
 CUR_FUPS="[]"
 CARRY_TXT=""
 CARRY_FILES="[]"
+OFF_CHECK_N=0
+WORKROOT="$(pwd)"
 
-cfg="$(curl -sf "$API/config" "${AH[@]}")" || { echo "FATAL: cannot fetch config"; exit 1; }
-OC_KEY="$(echo "$cfg" | jq -r '.opencode_key // ""')"
-OR_KEY="$(echo "$cfg" | jq -r '.keys.openrouter // ""')"
-GEM_KEY="$(echo "$cfg" | jq -r '.keys.gemini // ""')"
-HB_MIN="$(echo "$cfg" | jq -r '.heartbeat_min // 15')"
-IDLE_MIN="$(echo "$cfg" | jq -r '.idle_min // 60')"
-RENEW_MIN="$(echo "$cfg" | jq -r '.renew_min // 330')"
-export OPENCODE_API_KEY="$OC_KEY"
-export OPENROUTER_API_KEY="$OR_KEY"
-export GEMINI_API_KEY="$GEM_KEY"
-export GOOGLE_API_KEY="$GEM_KEY"
-export GOOGLE_GENERATIVE_AI_API_KEY="$GEM_KEY"
+# ---------- task-scoped helpers (read TASK_ID/TASK_TOKEN at call time) ----------
+tjpost() { curl -sf -X POST "$API/$1" -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}" -H 'Content-Type: application/json' -d "$2" >/dev/null 2>&1 || true; }
+post_msg()  { tjpost message "$(jq -cn --arg t "$1" '{text:$t}')"; }
+post_done() { tjpost done    "$(jq -cn --arg t "${1:-}" '{text:$t}')"; }
+post_fail() { tjpost fail    "$(jq -cn --arg t "${1:-agent error}" '{text:$t}')"; }
+hb_now()    { tjpost status  "⏳ هنوز در حال اجراست..."; }
 
-mkdir -p "$HOME/.config/opencode"
-# NOTE: do not add a permission block here — denying any built-in tool makes the
-# opencode zen free tier reject requests with FreeTierError
-cat > "$HOME/.config/opencode/opencode.json" <<JSON
+fetch_config() {
+  local cfg
+  cfg="$(curl -sf "$API/config" -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}")" || { echo "FATAL: cannot fetch config"; return 1; }
+  OC_KEY="$(echo "$cfg" | jq -r '.opencode_key // ""')"
+  OR_KEY="$(echo "$cfg" | jq -r '.keys.openrouter // ""')"
+  GEM_KEY="$(echo "$cfg" | jq -r '.keys.gemini // ""')"
+  HB_MIN="$(echo "$cfg" | jq -r '.heartbeat_min // 15')"
+  IDLE_MIN="$(echo "$cfg" | jq -r '.idle_min // 10')"
+  RENEW_MIN="$(echo "$cfg" | jq -r '.renew_min // 330')"
+  export OPENCODE_API_KEY="$OC_KEY"
+  export OPENROUTER_API_KEY="$OR_KEY"
+  export GEMINI_API_KEY="$GEM_KEY"
+  export GOOGLE_API_KEY="$GEM_KEY"
+  export GOOGLE_GENERATIVE_AI_API_KEY="$GEM_KEY"
+  return 0
+}
+
+setup_oc() {
+  mkdir -p "$HOME/.config/opencode"
+  # NOTE: do not add a permission block here — denying any built-in tool makes
+  # the opencode zen free tier reject requests with FreeTierError
+  cat > "$HOME/.config/opencode/opencode.json" <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
   "share": "disabled",
   "provider": { "opencode": { "options": { "apiKey": "$OC_KEY" } } }
 }
 JSON
-
-mkdir -p work && cd work
-cp -f ../AGENTS.md . 2>/dev/null || true
-git init -q . 2>/dev/null || true
-git config user.email agent@local 2>/dev/null || true
-git config user.name agent 2>/dev/null || true
-git add -A >/dev/null 2>&1 || true
-git commit -qm init >/dev/null 2>&1 || true
-
-jpost() { curl -sf -X POST "$API/$1" "${AH[@]}" -H 'Content-Type: application/json' -d "$2" >/dev/null 2>&1 || true; }
-post_msg()  { jpost message "$(jq -cn --arg t "$1" '{text:$t}')"; }
-post_done() { jpost done    "$(jq -cn --arg t "${1:-}" '{text:$t}')"; }
-post_fail() { jpost fail    "$(jq -cn --arg t "${1:-agent error}" '{text:$t}')"; }
-hb_now()    { jpost status  "⏳ هنوز در حال اجراست..."; }
+}
 
 poll() {
   local r
-  r="$(curl -sf "$API/poll" "${AH[@]}" 2>/dev/null || echo '{}')"
+  r="$(curl -sf "$API/poll" -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}" 2>/dev/null || echo '{}')"
   KILL="$(echo "$r" | jq -r '.kill // false')"
   END="$(echo "$r" | jq -r '.end // false')"
   FUPS="$(echo "$r" | jq -c '.followups // []')"
@@ -80,38 +86,46 @@ poll() {
 hb_due() { [ $(( $(date +%s) - LAST_HB )) -ge $(( HB_MIN * 60 )) ]; }
 renew_due() { [ $(( $(date +%s) - START_TS )) -ge $(( RENEW_MIN * 60 )) ]; }
 
-# hand the task over to a fresh runner and exit cleanly.
-# carry_text/carry_files re-deliver the in-flight followup (if any) to the new
-# attempt; the base prompt is re-dispatched by the worker from the task record.
+# daemon-only: check the off flag without claiming tasks (every ~60s mid-task)
+runner_off() {
+  [ "$MODE" = "daemon" ] || return 1
+  OFF_CHECK_N=$((OFF_CHECK_N + 1))
+  [ $((OFF_CHECK_N % 4)) -ne 0 ] && return 1
+  local r
+  r="$(curl -sf -X POST "$API/next" -H "Authorization: Bearer ${RUNNER_TOKEN:-x}" -H 'Content-Type: application/json' \
+    -d '{"check":"off"}' 2>/dev/null || echo '{}')"
+  [ "$(echo "$r" | jq -r '.off // false')" = "true" ]
+}
+
+# hand the current task over to a fresh runner and exit cleanly.
 do_renew() {
   post_msg "⏳ سقف زمانی رانر گیت‌هاب (~۶ ساعت) نزدیک است؛ تسک روی رانر تازه ادامه پیدا می‌کند (کارِ این مرحله از نو شروع می‌شود)."
   local body code
   body="$(jq -cn --arg txt "$CARRY_TXT" --argjson files "${CARRY_FILES:-[]}" '{carry_text:$txt, carry_files:$files}' 2>/dev/null || echo '{"carry_text":"","carry_files":[]}')"
-  code="$(curl -s -o /tmp/renew_resp.json -w '%{http_code}' -X POST "$API/renew" "${AH[@]}" \
+  code="$(curl -s -o /tmp/renew_resp.json -w '%{http_code}' -X POST "$API/renew" \
+    -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}" \
     -H 'Content-Type: application/json' -d "$body" 2>/dev/null)" || code="000"
   echo "renew HTTP $code: $(cat /tmp/renew_resp.json 2>/dev/null | head -c 200)"
   case "$code" in
     200) : ;;
     000|5*)
-      # worker unreachable — fall back to dispatching directly with the run token
       if [ -n "${GITHUB_TOKEN:-}" ]; then
         curl -sf -X POST \
           -H "Authorization: Bearer $GITHUB_TOKEN" \
           -H "Accept: application/vnd.github+json" \
           "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
-          -d "$(jq -cn --arg tid "$TASK_ID" --arg m "$MODEL" --arg p "$PROMPT" --arg w "$WORKER_URL" --arg tt "$TASK_TOKEN" \
-            '{event_type:"agent-task",client_payload:{task_id:$tid,model:$m,prompt:$p,worker_url:$w,task_token:$tt}}')" >/dev/null 2>&1 || true
+          -d "$(jq -cn --arg w "$WORKER_URL" --arg rt "${RUNNER_TOKEN:-}" \
+            '{event_type:"agent-boot",client_payload:{worker_url:$w,runner_token:$rt}}')" >/dev/null 2>&1 || true
       fi
       ;;
-    *) : ;; # worker explicitly refused (attempt limit / task closed) — respect it
+    *) : ;; # worker explicitly refused — respect it
   esac
   exit 0
 }
 
-# run opencode with kill/end/renew monitoring; results in OUT/RC
+# run opencode with kill/end/renew/off monitoring; results in OUT/RC
 run_oc() {
   local msg="$1" outfile errfile pid
-  CUR_MSG="$msg"
   CUR_FUPS="$FUPS"
   outfile="$(mktemp)"; errfile="$(mktemp)"
   local -a args=(run --model "$MODEL")
@@ -129,8 +143,12 @@ run_oc() {
       pkill -9 -f opencode 2>/dev/null; kill -9 "$pid" 2>/dev/null
       RC=143; OUT=""; return
     fi
+    if runner_off; then
+      pkill -9 -f opencode 2>/dev/null; kill -9 "$pid" 2>/dev/null
+      post_fail "ایجنت با دستور شما (/off) خاموش شد؛ تسک نیمه‌کاره ماند."
+      RC=144; OUT=""; return
+    fi
     if renew_due; then
-      # build carry payload from the followup that is currently being processed
       if [ "$RUN_COUNT" -gt 0 ]; then
         CARRY_TXT="$(echo "$CUR_FUPS" | jq -r '[.[] | select(.text != null and .text != "") | .text] | join("\n---\n")' 2>/dev/null || echo "")"
       else
@@ -150,20 +168,24 @@ run_oc() {
 }
 
 finish_run_output() {
+  TASK_REASON="ok"
   if [ "$RC" = "130" ]; then
     post_msg "🛑 اجرای عامل متوقف شد (کیل)."
     post_done "killed by user"
-    exit 0
+    TASK_REASON="killed"; return
   fi
   if [ "$RC" = "143" ]; then
     post_msg "🏁 اجرای عامل به درخواست شما پایان یافت."
     post_done "ended by user"
-    exit 0
+    TASK_REASON="ended"; return
+  fi
+  if [ "$RC" = "144" ]; then
+    TASK_REASON="failed"; return
   fi
   if [ "$RC" -ne 0 ]; then
     post_msg "⚠️ عامل با خطا خارج شد (کد $RC)."
     post_fail "opencode exit code $RC"
-    exit 1
+    TASK_REASON="failed"; return
   fi
   if [ -n "$OUT" ]; then post_msg "$OUT"; else post_msg "(پاسخ متنی خالی بود)"; fi
   LAST_ACT="$(date +%s)"
@@ -175,7 +197,7 @@ dl_followup_files() {
   local name url
   while IFS=$'\t' read -r name url; do
     [ -z "${url:-}" ] && continue
-    curl -sf "$url" "${AH[@]}" -o "uploads/$name" && echo "uploads/$name"
+    curl -sf "$url" -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}" -o "uploads/$name" && echo "uploads/$name"
   done < <(echo "$FUPS" | jq -r '.[] | .files[]? | [.name, .url] | @tsv' 2>/dev/null)
 }
 
@@ -194,35 +216,108 @@ $txt"
   finish_run_output
 }
 
-# ---------- main ----------
-jpost register "{\"run_id\":${GITHUB_RUN_ID:-0}}"
-post_msg "▶️ شروع تسک با مدل $MODEL"
+# download the task's initial files (wizard uploads) into ./uploads
+dl_initial_files() {
+  mkdir -p uploads
+  local name url
+  while IFS=$'\t' read -r name url; do
+    [ -z "${url:-}" ] && continue
+    curl -sf "$url" -H "Authorization: Bearer ${TASK_TOKEN:-x}" -H "X-Task-Id: ${TASK_ID:-x}" -o "uploads/$name" && echo "uploads/$name"
+  done < <(echo "$1" | jq -r '.[] | [.name, .url] | @tsv' 2>/dev/null)
+}
 
-run_oc "$PROMPT"
-finish_run_output
+# one full task lifecycle: setup → first run → followup loop → close.
+# returns when the task is closed for any reason (TASK_REASON set).
+task_session() {
+  local init_files="$1" paths msg
+  if ! fetch_config; then TASK_REASON="failed"; return 1; fi
+  setup_oc
+  mkdir -p "work/$TASK_ID" && cd "work/$TASK_ID" || { TASK_REASON="failed"; return 1; }
+  cp -f "$WORKROOT/AGENTS.md" . 2>/dev/null || true
+  git init -q . 2>/dev/null || true
+  git config user.email agent@local 2>/dev/null || true
+  git config user.name agent 2>/dev/null || true
+  git add -A >/dev/null 2>&1 || true
+  git commit -qm init >/dev/null 2>&1 || true
+  paths="$(dl_initial_files "$init_files" | tr '\n' ' ')"
+  tjpost register "{\"run_id\":${GITHUB_RUN_ID:-0}}"
+  msg="$PROMPT"
+  [ -n "${paths// /}" ] && msg="$msg
+فایل‌های اولیه (ذخیره‌شده در): $paths"
+  post_msg "▶️ شروع تسک با مدل $MODEL"
+  run_oc "$msg"
+  finish_run_output
+  [ "$TASK_REASON" != "ok" ] && { cd "$WORKROOT" 2>/dev/null || true; return 0; }
+  # followup / idle loop (task stays open for followups)
+  while true; do
+    sleep "$POLL_S"
+    poll
+    if [ "$KILL" = "true" ]; then
+      post_msg "🛑 تسک متوقف شد."
+      post_done "killed by user"
+      TASK_REASON="killed"; cd "$WORKROOT" 2>/dev/null || true; return 0
+    fi
+    if [ "$END" = "true" ]; then
+      post_msg "🏁 تسک بسته شد."
+      post_done "ended by user"
+      TASK_REASON="ended"; cd "$WORKROOT" 2>/dev/null || true; return 0
+    fi
+    if [ "$FUPS" != "[]" ]; then
+      apply_followups
+      [ "$TASK_REASON" != "ok" ] && { cd "$WORKROOT" 2>/dev/null || true; return 0; }
+      continue
+    fi
+    if hb_due; then hb_now; LAST_HB="$(date +%s)"; fi
+    if [ $(( $(date +%s) - LAST_ACT )) -ge $(( IDLE_MIN * 60 )) ]; then
+      post_msg "✅ $IDLE_MIN دقیقه پیام جدیدی نرسید؛ تسک بسته شد."
+      post_done "idle timeout"
+      TASK_REASON="ok"; cd "$WORKROOT" 2>/dev/null || true; return 0
+    fi
+  done
+}
 
-# followup / idle loop
+# ---------- legacy single-task mode ----------
+if [ "$MODE" = "legacy" ]; then
+  task_session "[]" || true
+  exit 0
+fi
+
+# ---------- daemon mode ----------
+: "${RUNNER_TOKEN:?RUNNER_TOKEN missing for daemon mode}"
+
+# announce boot
+curl -sf -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"booted":true}' >/dev/null 2>&1 || true
+
+IDLE_START=0
 while true; do
-  sleep "$POLL_S"
-  poll
-  if [ "$KILL" = "true" ]; then
-    post_msg "🛑 تسک متوقف شد."
-    post_done "killed by user"
-    exit 0
+  r="$(curl -sf -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -cn --argjson rid "${GITHUB_RUN_ID:-0}" '{run_id:$rid}')" 2>/dev/null || echo '{}')"
+  if [ "$(echo "$r" | jq -r '.off // false')" = "true" ]; then
+    echo "agent off by user"; exit 0
   fi
-  if [ "$END" = "true" ]; then
-    post_msg "🏁 تسک بسته شد."
-    post_done "ended by user"
-    exit 0
-  fi
-  if [ "$FUPS" != "[]" ]; then
-    apply_followups
+  tid="$(echo "$r" | jq -r '.task.task_id // ""')"
+  if [ -z "$tid" ] || [ "$tid" = "null" ]; then
+    AGENT_IDLE_MIN="$(echo "$r" | jq -r '.idle_min // 10')"
+    [ "$IDLE_START" -eq 0 ] && IDLE_START="$(date +%s)"
+    if [ $(( $(date +%s) - IDLE_START )) -ge $(( AGENT_IDLE_MIN * 60 )) ]; then
+      curl -sf -X POST "$API/next" -H "Authorization: Bearer $RUNNER_TOKEN" -H 'Content-Type: application/json' \
+        -d '{"bye":true}' >/dev/null 2>&1 || true
+      exit 0
+    fi
+    sleep "$POLL_S"
     continue
   fi
-  if hb_due; then hb_now; LAST_HB="$(date +%s)"; fi
-  if [ $(( $(date +%s) - LAST_ACT )) -ge $(( IDLE_MIN * 60 )) ]; then
-    post_msg "✅ $IDLE_MIN دقیقه پیام جدیدی نرسید؛ تسک بسته شد. برای کار جدید /new"
-    post_done "idle timeout"
-    exit 0
-  fi
+  IDLE_START=0
+  TASK_ID="$tid"
+  TASK_TOKEN="$(echo "$r" | jq -r '.task.task_token // ""')"
+  MODEL="$(echo "$r" | jq -r '.task.model // ""')"
+  PROMPT="$(echo "$r" | jq -r '.task.prompt // ""')"
+  INIT_FILES="$(echo "$r" | jq -c '.task.files // []')"
+  RUN_COUNT=0
+  KILL=false; END=false; RC=0; OUT=""
+  LAST_HB="$(date +%s)"; LAST_ACT="$(date +%s)"
+  task_session "$INIT_FILES" || true
+  cd "$WORKROOT" 2>/dev/null || true
+  sleep 3
 done

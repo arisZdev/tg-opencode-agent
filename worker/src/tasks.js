@@ -20,16 +20,58 @@ export async function listTasks(env) {
   return out;
 }
 
-// one GitHub Actions run per task, via repository_dispatch
-export async function dispatchTask(env, t) {
-  return gh(env, `/repos/${env.GH_OWNER}/${env.GH_REPO}/dispatches`, "POST", {
-    event_type: "agent-task",
-    client_payload: {
-      task_id: t.id, model: t.model, prompt: t.prompt,
-      worker_url: env.WORKER_PUBLIC_URL,
-      task_token: t.token,
-    },
+// ---------- runner (agent daemon) lifecycle ----------
+// All runs are "daemon" boots: the runner starts, asks /agent/next for queued
+// tasks one by one, and shuts itself down after AGENT_IDLE_MIN idle minutes.
+// Short, task-scoped runs keep the GitHub usage pattern low-profile (ban-safe).
+export async function startAgent(env, { force = false } = {}) {
+  if (!env.RUNNER_TOKEN) return { ok: false, status: 500 };
+  if (!force) {
+    const last = Number((await env.KV.get("g:boot_at").catch(() => null)) || 0);
+    if (last && Date.now() - last < 120_000) return { ok: true, already: true };
+    const r = await gh(env, `/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/runs?per_page=6`);
+    if (r.ok && (r.j?.workflow_runs || []).some((x) => x.status === "in_progress" || x.status === "queued")) {
+      return { ok: true, already: true };
+    }
+  }
+  const d = await gh(env, `/repos/${env.GH_OWNER}/${env.GH_REPO}/dispatches`, "POST", {
+    event_type: "agent-boot",
+    client_payload: { worker_url: env.WORKER_PUBLIC_URL, runner_token: env.RUNNER_TOKEN },
   });
+  if (!d.ok) return { ok: false, status: d.status };
+  try { await env.KV.put("g:boot_at", String(Date.now())); } catch (e) {}
+  return { ok: true, started: true };
+}
+
+export async function stopAgent(env) {
+  try { await env.KV.put("g:agent_off", "1", { expirationTtl: 3600 }); } catch (e) {}
+  return { ok: true };
+}
+
+// runner asks for work. checkOnly=true never claims a task (used mid-task to
+// poll the off flag). Claiming marks the oldest queued task as running.
+export async function runnerNext(env, runId, { checkOnly = false } = {}) {
+  const idleMin = Number(env.AGENT_IDLE_MIN || env.IDLE_MIN || 10);
+  let off = false;
+  try { off = !!(await env.KV.get("g:agent_off")); } catch (e) {}
+  if (off || checkOnly) return { ok: true, off, task: null, idle_min: idleMin };
+  try { await env.KV.delete("g:agent_off"); } catch (e) {}
+  const tasks = await listTasks(env);
+  const t = tasks.filter((x) => x.status === "queued").sort((a, b) => (a.created || 0) - (b.created || 0))[0];
+  if (!t) return { ok: true, off: false, task: null, idle_min: idleMin };
+  t.status = "running";
+  t.claim_run = Number(runId) || null;
+  t.claim_at = Date.now();
+  t.updated = Date.now();
+  try { await putTask(env, t); } catch (e) { console.error("claim put", String(e)); }
+  return {
+    ok: true, off: false, idle_min: idleMin,
+    task: {
+      task_id: t.id, task_token: t.token, model: t.model, prompt: t.prompt,
+      files: (t.files || []).filter((f) => f && f.key)
+        .map((f) => ({ name: f.name, url: `${env.WORKER_PUBLIC_URL}/agent/file/${f.key}` })),
+    },
+  };
 }
 
 function dispatchFailMsg(status) {
@@ -54,12 +96,11 @@ export async function createTask(env, { prompt, model, files, idle_min, hb_min }
     console.error("createTask put", String(e));
   });
 
-  const d = await dispatchTask(env, t);
-
-  if (!d.ok) {
-    t.status = "failed"; t.error = "dispatch failed HTTP " + d.status;
+  const s = await startAgent(env);
+  if (!s.ok) {
+    t.status = "failed"; t.error = "boot failed HTTP " + s.status;
     await putTask(env, t).catch((e) => console.error("createTask fail-put", String(e)));
-    await notify(env, dispatchFailMsg(d.status) || `⚠️ ساخت تسک ${id} روی گیت‌هاب ناموفق بود (HTTP ${d.status}).`);
+    await notify(env, dispatchFailMsg(s.status) || `⚠️ روشن‌کردن ایجنت برای تسک ${id} ناموفق بود (HTTP ${s.status}).`);
     return { t, ok: false };
   }
   // if the very first write failed (KV quota), the task record is missing —
@@ -72,10 +113,11 @@ export async function createTask(env, { prompt, model, files, idle_min, hb_min }
 
   const nfiles = (files || []).length;
   await notify(env,
-    `🚀 تسک ${id} ساخته شد و به گیت‌هاب اکشنز سپرده شد.\n` +
+    `🚀 تسک ${id} در صف قرار گرفت.\n` +
     `🧠 مدل: ${model}\n` +
     `📝 پرامپت: ${String(prompt).slice(0, 300)}${String(prompt).length > 300 ? "…" : ""}\n` +
-    `📁 فایل‌ها: ${nfiles}\n\n` +
+    `📁 فایل‌ها: ${nfiles}\n` +
+    `🤖 ایجنت: ${s.started ? "روشن می‌شود و تسک را برمی‌دارد" : "از قبل روشن است؛ تسک را برمی‌دارد"}\n\n` +
     `📊 وضعیت: /tasks\n💬 وسط کار هر متن/فایلی بفرستی ادامه میدم.`);
   return { t, ok: true };
 }
@@ -122,9 +164,11 @@ export async function renewTask(env, t, carry = {}) {
   t.followups = fups;
   try { await putTask(env, t); } catch (e) { console.error("renew put", String(e)); }
 
-  const d = await dispatchTask(env, t);
+  // force boot: the old runner is still alive at this moment, so the normal
+  // in_progress check would wrongly say "already running"
+  const d = await startAgent(env, { force: true });
   if (!d.ok) {
-    t.status = "failed"; t.error = "renew dispatch failed HTTP " + d.status;
+    t.status = "failed"; t.error = "renew boot failed HTTP " + d.status;
     try { await putTask(env, t); } catch {}
     await notify(env, dispatchFailMsg(d.status) || `⚠️ تمدید اجرای ${t.id} ناموفق بود (HTTP ${d.status}).`);
     return { ok: false, error: d.status };
@@ -166,16 +210,26 @@ export async function syncFromGithub(env, t) {
 
 // cron watchdog: revives stuck tasks and syncs run state
 export async function cronCheck(env) {
+  let off = false;
+  try { off = !!(await env.KV.get("g:agent_off")); } catch (e) {}
   const tasks = await listTasks(env);
   for (const t of tasks) {
     try {
       if (!["queued", "running"].includes(t.status)) continue;
       if (!t.run_id) {
+        // claimed by a runner but never registered? requeue after 5 min
+        if (t.status === "running" && t.claim_at && Date.now() - t.claim_at > 5 * 60_000) {
+          t.status = "queued"; t.claim_run = null; t.claim_at = null;
+          await putTask(env, t).catch(() => {});
+          continue;
+        }
+        if (t.status === "running") continue; // claimed just now, registering
         const age = Date.now() - t.created;
         const sinceRenew = t.renewed_at ? Date.now() - t.renewed_at : Infinity;
-        // never started? give the runner ~10 min to boot, then re-dispatch (up to 3 attempts)
+        if (off) continue; // user turned the agent off — tasks wait for /on
+        // never picked up? try to boot the runner (throttled), give up after 4 attempts
         if (age > 10 * 60_000 && sinceRenew > 5 * 60_000) {
-          if (Number(t.attempt || 1) < 3) {
+          if (Number(t.attempt || 1) < 4) {
             t.attempt = Number(t.attempt || 1) + 1;
             t.renewed_at = Date.now();
             try {
@@ -184,18 +238,18 @@ export async function cronCheck(env) {
               console.error("revive put", String(e)); // KV quota — retry next cycle
               continue;
             }
-            const d = await dispatchTask(env, t);
-            if (d.ok) {
-              await notify(env, `🔁 تسک ${t.id} روی گیت‌هاب شروع نشده بود؛ دوباره سپرده شد (تلاش ${t.attempt}).`);
+            const s = await startAgent(env);
+            if (s.ok) {
+              if (s.started) await notify(env, `🔁 تسک ${t.id} هنوز برداشته نشده بود؛ دوباره درخواست روشن‌کردن ایجنت دادم (تلاش ${t.attempt}).`);
             } else {
-              t.status = "failed"; t.error = "dispatch failed HTTP " + d.status;
-              await putTask(env, t);
-              await notify(env, dispatchFailMsg(d.status) || `⚠️ تسک ${t.id} شروع نشد (dispatch HTTP ${d.status}).`);
+              t.status = "failed"; t.error = "boot failed HTTP " + s.status;
+              await putTask(env, t).catch(() => {});
+              await notify(env, dispatchFailMsg(s.status) || `⚠️ روشن‌کردن ایجنت برای ${t.id} ناموفق بود (HTTP ${s.status}).`);
             }
           } else {
-            t.status = "failed"; t.error = "run never started (attempts exhausted)";
-            await putTask(env, t);
-            await notify(env, `⚠️ تسک ${t.id} پس از چند تلاش روی گیت‌هاب شروع نشد.`);
+            t.status = "failed"; t.error = "never picked up (attempts exhausted)";
+            await putTask(env, t).catch(() => {});
+            await notify(env, `⚠️ تسک ${t.id} پس از چند تلاش برداشته نشد.`);
           }
         }
         continue;

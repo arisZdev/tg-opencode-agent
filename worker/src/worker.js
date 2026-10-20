@@ -1,7 +1,7 @@
 // ---------- worker entry: router ----------
 import { json, text, rj, b64ToBuf } from "./util.js";
 import { handleUpdate } from "./bot.js";
-import { cronCheck, getTask, putTask, renewTask } from "./tasks.js";
+import { cronCheck, getTask, putTask, renewTask, runnerNext } from "./tasks.js";
 import { notify, notifyDoc } from "./notify.js";
 import * as DB from "./db.js";
 
@@ -101,6 +101,23 @@ async function authTask(env, req, url) {
 
 async function agentRoute(env, req, url, ctx) {
   const p = url.pathname;
+
+  // daemon runner: ask for work / signal boot / say goodbye (runner-token auth)
+  if (p === "/agent/next" && req.method === "POST") {
+    const tok = ((req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "")).trim();
+    if (!env.RUNNER_TOKEN || tok !== env.RUNNER_TOKEN) return json({ ok: false, error: "unauthorized" }, 401);
+    const b = await rj(req);
+    if (b.bye) {
+      ctx.waitUntil(notify(env, "⏹ ایجنت خاموش شد (۱۰ دقیقه تسک جدیدی نبود)."));
+      return json({ ok: true });
+    }
+    if (b.booted) {
+      ctx.waitUntil(notify(env, "🟢 ایجنت روشن شد و منتظر تسک است."));
+      return json({ ok: true });
+    }
+    if (b.check === "off") return json(await runnerNext(env, b.run_id, { checkOnly: true }));
+    return json(await runnerNext(env, b.run_id));
+  }
 
   if (p === "/agent/config" && req.method === "GET") {
     const t = await authTask(env, req, url);
