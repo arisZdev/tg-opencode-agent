@@ -40,6 +40,7 @@ CUR_FUPS="[]"
 CARRY_TXT=""
 CARRY_FILES="[]"
 OFF_CHECK_N=0
+UPN=-1   # uploads count from the last poll (-1 = unknown / old worker)
 WORKROOT="$(pwd)"
 
 # ---------- task-scoped helpers (read TASK_ID/TASK_TOKEN at call time) ----------
@@ -85,6 +86,7 @@ poll() {
   KILL="$(echo "$r" | jq -r '.kill // false')"
   END="$(echo "$r" | jq -r '.end // false')"
   FUPS="$(echo "$r" | jq -c '.followups // []')"
+  UPN="$(echo "$r" | jq -r '.uploads // -1')"
 }
 
 hb_due() { [ $(( $(date +%s) - LAST_HB )) -ge $(( HB_MIN * 60 )) ]; }
@@ -173,13 +175,16 @@ run_oc() {
 
 finish_run_output() {
   TASK_REASON="ok"
+  # diagnosability: the opencode session output itself never reaches the
+  # Actions log — these metric lines are the only window into a silent session
+  echo "[task] $TASK_ID oc-finished rc=$RC out=${#OUT}c uploads=$UPN"
   if [ "$RC" = "130" ]; then
-    post_msg "🛑 اجرای عامل متوقف شد (کیل)."
+    post_msg "🛑 اجرای عامل متوقف شد (کیل).$( [ "$UPN" = "0" ] && echo ' ⚠️ هیچ فایلی آپلود نشده بود.')"
     post_done "killed by user"
     TASK_REASON="killed"; return
   fi
   if [ "$RC" = "143" ]; then
-    post_msg "🏁 اجرای عامل به درخواست شما پایان یافت."
+    post_msg "🏁 اجرای عامل به درخواست شما پایان یافت.$( [ "$UPN" = "0" ] && echo ' ⚠️ هیچ فایلی آپلود نشده بود.')"
     post_done "ended by user"
     TASK_REASON="ended"; return
   fi
@@ -259,6 +264,7 @@ $PROMPT"
   [ -n "${paths// /}" ] && msg="$msg
 فایل‌های اولیه (ذخیره‌شده در): $paths"
   post_msg "▶️ شروع تسک با مدل $MODEL"
+  echo "[task] $TASK_ID session-start model=$MODEL"
   run_oc "$msg"
   finish_run_output
   [ "$TASK_REASON" != "ok" ] && { cd "$WORKROOT" 2>/dev/null || true; return 0; }
@@ -267,12 +273,12 @@ $PROMPT"
     sleep "$POLL_S"
     poll
     if [ "$KILL" = "true" ]; then
-      post_msg "🛑 تسک متوقف شد."
+      post_msg "🛑 تسک متوقف شد.$( [ "$UPN" = "0" ] && echo ' ⚠️ هیچ فایلی آپلود نشده بود.')"
       post_done "killed by user"
       TASK_REASON="killed"; cd "$WORKROOT" 2>/dev/null || true; return 0
     fi
     if [ "$END" = "true" ]; then
-      post_msg "🏁 تسک بسته شد."
+      post_msg "🏁 تسک بسته شد.$( [ "$UPN" = "0" ] && echo ' ⚠️ هیچ فایلی آپلود نشده بود.')"
       post_done "ended by user"
       TASK_REASON="ended"; cd "$WORKROOT" 2>/dev/null || true; return 0
     fi
@@ -283,8 +289,9 @@ $PROMPT"
     fi
     if hb_due; then hb_now; LAST_HB="$(date +%s)"; fi
     if [ $(( $(date +%s) - LAST_ACT )) -ge $(( IDLE_MIN * 60 )) ]; then
-      post_msg "✅ $IDLE_MIN دقیقه پیام جدیدی نرسید؛ تسک بسته شد."
+      post_msg "✅ $IDLE_MIN دقیقه پیام جدیدی نرسید؛ تسک بسته شد.$( [ "$UPN" = "0" ] && echo ' ⚠️ توجه: این تسک بدون هیچ فایل آپلودشده‌ای تمام شد.')"
       post_done "idle timeout"
+      echo "[task] $TASK_ID close reason=idle-timeout uploads=$UPN"
       TASK_REASON="ok"; cd "$WORKROOT" 2>/dev/null || true; return 0
     fi
   done
@@ -343,9 +350,11 @@ while true; do
   BASE_PROMPT="$(echo "$r" | jq -r '.task.base // ""')"
   INIT_FILES="$(echo "$r" | jq -c '.task.files // []')"
   RUN_COUNT=0
+  UPN=-1
   KILL=false; END=false; RC=0; OUT=""
   LAST_HB="$(date +%s)"; LAST_ACT="$(date +%s)"
   task_session "$INIT_FILES" || true
+  echo "[task] $TASK_ID session-end reason=${TASK_REASON:-?} uploads=$UPN"
   cd "$WORKROOT" 2>/dev/null || true
   sleep 3
 done
